@@ -1,3 +1,0 @@
-python -m grpc_tools.prot -I. --python_out=. --grpc_python_out=. bittorrent.proto
-python3 tracker.py
-
