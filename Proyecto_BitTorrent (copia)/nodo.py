@@ -17,8 +17,8 @@ import socket
 
 # --- CONFIGURACIÓN ---
 CHUNK_SIZE = 64 * 1024  # 64KB por pedazo
-# Ajusta esto a la IP de la máquina que corre el tracker si es diferente
-TRACKER_HOST = 'localhost' 
+# Ajusta esto a la IP de la máquina que corre el tracker
+TRACKER_HOST = '10.86.28.228' 
 TRACKER_PORT = '50051'
 
 def obtener_mi_ip_real():
@@ -65,11 +65,8 @@ class P2PServicer(bittorrent_pb2_grpc.P2PServiceServicer):
             print(f"Error leyendo archivo: {e}")
             return bittorrent_pb2.DataChunk(encontrado=False, datos=b'', indice_chunk=indice)
 
-    # --- ESTA ES LA FUNCIÓN QUE TE FALTABA O ESTABA MAL PUESTA ---
     def ObtenerInfoArchivo(self, request, context):
-        # --- CORRECCIÓN: Usamos request.nombre_archivo (como dice el proto) ---
         nombre_buscado = request.nombre_archivo 
-        
         full_path = os.path.join(self.directorio, nombre_buscado)
         
         if not os.path.exists(full_path):
@@ -80,7 +77,7 @@ class P2PServicer(bittorrent_pb2_grpc.P2PServiceServicer):
         total_chunks = math.ceil(size / CHUNK_SIZE)
         
         return bittorrent_pb2.InfoArchivo(
-            nombre=nombre_buscado, # Aquí sí se usa 'nombre' porque es el mensaje de respuesta
+            nombre=nombre_buscado,
             tamano_bytes=size,
             total_chunks=total_chunks,
             existe=True
@@ -246,8 +243,8 @@ class NodoGUI(tk.Tk):
                 if i in chunks_descargados:
                     continue # ¡SALTAR ESTE CHUNK SI YA LO TENEMOS!
                 
-                peer_asignado = peers[i % len(peers)]
-                tarea = executor.submit(self._descargar_un_chunk, peer_asignado, nombre_archivo, i)
+                # CORRECCIÓN: Pasamos 'peers' (la lista completa) en lugar de un solo peer asignado
+                tarea = executor.submit(self._descargar_un_chunk, peers, nombre_archivo, i)
                 tareas[tarea] = i
             
             if not tareas:
@@ -262,7 +259,6 @@ class NodoGUI(tk.Tk):
                     chunks_descargados.add(indice)
                     
                     # GUARDAR PROGRESO EN DISCO (Para tolerancia a fallos)
-                    # Guardamos cada vez (o podrías guardar cada X chunks)
                     with open(ruta_progreso, 'w') as f:
                         json.dump(list(chunks_descargados), f)
                     
@@ -275,7 +271,6 @@ class NodoGUI(tk.Tk):
 
         if len(chunks_descargados) == total_chunks:
             self.log(f"--- DESCARGA COMPLETADA AL 100% ---")
-            # Borramos el archivo de progreso porque ya acabamos
             if os.path.exists(ruta_progreso):
                 os.remove(ruta_progreso)
                 
@@ -286,15 +281,13 @@ class NodoGUI(tk.Tk):
 
     def _obtener_numero_chunks(self, peer_address, nombre_archivo):
         try:
-            # Corrección para manejo de IPs locales vs reales
             if "localhost" in peer_address:
                 address = peer_address
             else:
-                address = peer_address # Asumimos que viene correcto del tracker
+                address = peer_address 
                 
             with grpc.insecure_channel(address) as channel:
                 stub = bittorrent_pb2_grpc.P2PServiceStub(channel)
-                # Llamada al nuevo RPC
                 info = stub.ObtenerInfoArchivo(bittorrent_pb2.BusquedaArchivo(nombre_archivo=nombre_archivo))
                 
                 if info.existe:
@@ -307,25 +300,43 @@ class NodoGUI(tk.Tk):
             self.log(f"Error obteniendo info de {peer_address}: {e}")
             return 0
 
-    def _descargar_un_chunk(self, peer, nombre_archivo, indice):
-        try:
-            with grpc.insecure_channel(peer) as channel:
-                stub = bittorrent_pb2_grpc.P2PServiceStub(channel)
-                req = bittorrent_pb2.PeticionChunk(nombre_archivo=nombre_archivo, indice_chunk=indice)
-                resp = stub.SolicitarChunk(req)
+    # CORRECCIÓN: El nombre del parámetro aquí debe coincidir con el que usamos adentro
+    def _descargar_un_chunk(self, lista_peers, nombre_archivo, indice):
+        """
+        Intenta descargar el chunk 'indice' probando los peers de la lista.
+        Si el peer asignado falla, intenta con el siguiente.
+        """
+        num_peers = len(lista_peers)
+        start_index = indice % num_peers  # Round Robin inicial
+        
+        for i in range(num_peers):
+            # Calcular el índice real en la lista circular
+            current_peer_idx = (start_index + i) % num_peers
+            peer = lista_peers[current_peer_idx]
+            
+            try:
+                address = peer
                 
-                if resp.encontrado and resp.datos:
-                    ruta_destino = os.path.join(self.mi_carpeta, nombre_archivo)
-                    with open(ruta_destino, 'r+b') as f:
-                        f.seek(indice * CHUNK_SIZE)
-                        f.write(resp.datos)
-                    self.log(f"Chunk #{indice} descargado de {peer}")
-                    return True
-                else:
-                    return False
-        except Exception as e:
-            self.log(f"Error descargando chunk {indice}: {e}")
-            return False
+                with grpc.insecure_channel(address) as channel:
+                    stub = bittorrent_pb2_grpc.P2PServiceStub(channel)
+                    req = bittorrent_pb2.PeticionChunk(nombre_archivo=nombre_archivo, indice_chunk=indice)
+                    
+                    resp = stub.SolicitarChunk(req, timeout=3) 
+                    
+                    if resp.encontrado and resp.datos:
+                        ruta_destino = os.path.join(self.mi_carpeta, nombre_archivo)
+                        with open(ruta_destino, 'r+b') as f:
+                            f.seek(indice * CHUNK_SIZE)
+                            f.write(resp.datos)
+                        
+                        self.log(f"Chunk #{indice} descargado de {peer}")
+                        return True # Misión cumplida
+                        
+            except Exception as e:
+                pass
+        
+        self.log(f"ERROR FATAL: Chunk #{indice} no se pudo recuperar de NINGÚN peer.")
+        return False
 
 if __name__ == "__main__":
     app = NodoGUI()
